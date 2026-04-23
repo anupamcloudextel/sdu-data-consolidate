@@ -12,6 +12,32 @@ def normalize_column_name(column_name: object) -> str:
     return "".join(text.split())
 
 
+def get_column_by_normalized_name(dataframe: pd.DataFrame, expected_name: str) -> str | None:
+    expected = normalize_column_name(expected_name)
+    for column in dataframe.columns:
+        if normalize_column_name(column) == expected:
+            return str(column)
+    return None
+
+
+def infer_circle_from_file_name(file_name: str) -> str:
+    known_circles = (
+        "Bangalore",
+        "Delhi",
+        "Kolkata",
+        "Mumbai",
+        "Pune",
+        "Punjab",
+        "UPW",
+        "Tamil Nadu",
+    )
+    lower_name = file_name.lower()
+    for circle in known_circles:
+        if circle.lower() in lower_name:
+            return circle
+    return ""
+
+
 def build_unified_columns(dataframes: list[pd.DataFrame]) -> tuple[list[str], dict[str, str]]:
     normalized_to_canonical: dict[str, str] = {}
     canonical_order: list[str] = []
@@ -40,11 +66,41 @@ def standardize_dataframe_columns(
         canonical_name = normalized_to_canonical[normalized]
         source_column = normalized_to_source_column.get(normalized)
         if source_column is not None:
-            aligned_data[canonical_name] = dataframe[source_column]
+            source_data = dataframe[source_column]
+            if isinstance(source_data, pd.DataFrame):
+                # Duplicate column labels can occur after promoting row 1 to headers.
+                # In that case, take the first matching column as the source series.
+                aligned_data[canonical_name] = source_data.iloc[:, 0]
+            else:
+                aligned_data[canonical_name] = source_data
         else:
             aligned_data[canonical_name] = pd.Series([pd.NA] * len(dataframe), index=dataframe.index)
 
     return pd.DataFrame(aligned_data, index=dataframe.index)
+
+
+def promote_first_row_as_header_if_needed(dataframe: pd.DataFrame) -> pd.DataFrame:
+    has_unnamed_headers = any(
+        str(column).strip().lower().startswith("unnamed:")
+        for column in dataframe.columns
+    )
+    if not has_unnamed_headers or dataframe.empty:
+        return dataframe
+
+    first_row = dataframe.iloc[0]
+    updated_columns: list[str] = []
+    for idx, column in enumerate(dataframe.columns):
+        candidate = first_row.iloc[idx]
+        candidate_text = str(candidate).strip() if not pd.isna(candidate) else ""
+        if candidate_text:
+            updated_columns.append(candidate_text)
+        else:
+            updated_columns.append(str(column).strip())
+
+    adjusted = dataframe.iloc[1:].copy()
+    adjusted.columns = updated_columns
+    adjusted.reset_index(drop=True, inplace=True)
+    return adjusted
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,22 +142,62 @@ def get_excel_files(folder: Path) -> list[Path]:
 
 def consolidate_sheet_from_files(
     excel_files: list[Path], sheet_name: str
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     collected: list[pd.DataFrame] = []
-    skipped_files: list[str] = []
+    report_rows: list[dict[str, object]] = []
 
     for file_path in excel_files:
         try:
             df = pd.read_excel(file_path, sheet_name=sheet_name)
+            df = promote_first_row_as_header_if_needed(df)
+            inferred_circle = infer_circle_from_file_name(file_path.name)
+            existing_circle_column = get_column_by_normalized_name(df, "Circle")
+            if existing_circle_column is None:
+                df["Circle"] = inferred_circle
+            else:
+                df["Circle"] = df[existing_circle_column].map(
+                    lambda value: str(value).strip() if not pd.isna(value) else ""
+                )
+                if inferred_circle:
+                    df.loc[df["Circle"] == "", "Circle"] = inferred_circle
+                if existing_circle_column != "Circle":
+                    df.drop(columns=[existing_circle_column], inplace=True)
             df["source_file_name"] = file_path.name
             collected.append(df)
+            report_rows.append(
+                {
+                    "file_name": file_path.name,
+                    "status": "SUCCESS",
+                    "rows_read": len(df),
+                    "rows_failed": 0,
+                    "error_reason": "",
+                }
+            )
             print(f"Included: {file_path.name} ({len(df)} rows)")
         except ValueError:
-            skipped_files.append(file_path.name)
+            report_rows.append(
+                {
+                    "file_name": file_path.name,
+                    "status": "FAILED",
+                    "rows_read": 0,
+                    "rows_failed": 0,
+                    "error_reason": f"Sheet '{sheet_name}' not found",
+                }
+            )
             print(f"Skipped (sheet '{sheet_name}' not found): {file_path.name}")
         except Exception as exc:
-            skipped_files.append(file_path.name)
+            report_rows.append(
+                {
+                    "file_name": file_path.name,
+                    "status": "FAILED",
+                    "rows_read": 0,
+                    "rows_failed": 0,
+                    "error_reason": str(exc),
+                }
+            )
             print(f"Skipped (read error): {file_path.name} -> {exc}")
+
+    report_df = pd.DataFrame(report_rows)
 
     if collected:
         canonical_order, normalized_to_canonical = build_unified_columns(collected)
@@ -113,13 +209,15 @@ def consolidate_sheet_from_files(
 
         # Keep source file column at the very beginning in output.
         source_column = "source_file_name"
-        ordered_columns = [source_column] + [
+        circle_column = "Circle"
+        ordered_columns = [source_column, circle_column] + [
             column for column in consolidated.columns if column != source_column
+            and column != circle_column
         ]
         consolidated = consolidated[ordered_columns]
-        return consolidated, skipped_files
+        return consolidated, report_df
 
-    return pd.DataFrame(), skipped_files
+    return pd.DataFrame(), report_df
 
 
 def main() -> int:
@@ -138,7 +236,7 @@ def main() -> int:
         print(f"No Excel files found in folder: {input_folder}")
         return 1
 
-    consolidated_df, skipped_files = consolidate_sheet_from_files(excel_files, sheet_name)
+    consolidated_df, report_df = consolidate_sheet_from_files(excel_files, sheet_name)
 
     if consolidated_df.empty:
         print(
@@ -148,12 +246,15 @@ def main() -> int:
         return 1
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    consolidated_df.to_excel(output_file, index=False)
+    with pd.ExcelWriter(output_file) as writer:
+        consolidated_df.to_excel(writer, sheet_name="Consolidated", index=False)
+        report_df.to_excel(writer, sheet_name="FileWiseReport", index=False)
 
     print("\nConsolidation complete.")
     print(f"Output file: {output_file}")
     print(f"Total input files found: {len(excel_files)}")
-    print(f"Files skipped: {len(skipped_files)}")
+    failed_files = int((report_df["status"] == "FAILED").sum()) if not report_df.empty else 0
+    print(f"Files skipped: {failed_files}")
     print(f"Total consolidated rows: {len(consolidated_df)}")
     return 0
 
