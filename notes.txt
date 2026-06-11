@@ -1,0 +1,8 @@
+Take Updated Sites from erp i.e Site.xlsx 
+Take Updated Master Tracker folder from onedrive 
+
+Then run 
+consolidate_hp_sheets.py will generate consolidated_hp.xlsx
+compare_cluster_site.py will generate cluster_site_comparison.xlsx
+build_rsu_master_from_consolidated.py will generate RSU Master Generated.xlsx
+build_rsu_hoto_from_consolidated.py will generate RSU Hoto Generated.xlsx

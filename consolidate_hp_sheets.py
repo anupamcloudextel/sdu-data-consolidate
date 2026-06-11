@@ -79,6 +79,38 @@ def standardize_dataframe_columns(
     return pd.DataFrame(aligned_data, index=dataframe.index)
 
 
+# Excel column R (0-based index 17) holds Link Type values in the HP sheet layout.
+LINK_TYPE_SOURCE_COLUMN_INDEX = 17
+LINK_TYPE_OUTPUT_COLUMN = "Link Type"
+
+
+def assign_link_type_from_column_r(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Map Excel column R values to a unified Link Type column on each row."""
+    if len(dataframe.columns) <= LINK_TYPE_SOURCE_COLUMN_INDEX:
+        dataframe[LINK_TYPE_OUTPUT_COLUMN] = pd.NA
+        return dataframe
+
+    source_column_name = dataframe.columns[LINK_TYPE_SOURCE_COLUMN_INDEX]
+    source_data = dataframe.iloc[:, LINK_TYPE_SOURCE_COLUMN_INDEX]
+    if isinstance(source_data, pd.DataFrame):
+        source_data = source_data.iloc[:, 0]
+
+    existing_link_type_column = get_column_by_normalized_name(
+        dataframe, LINK_TYPE_OUTPUT_COLUMN
+    )
+    if (
+        existing_link_type_column is not None
+        and existing_link_type_column != source_column_name
+    ):
+        dataframe.drop(columns=[existing_link_type_column], inplace=True)
+
+    dataframe[LINK_TYPE_OUTPUT_COLUMN] = source_data
+    if source_column_name != LINK_TYPE_OUTPUT_COLUMN:
+        dataframe.drop(columns=[source_column_name], inplace=True)
+
+    return dataframe
+
+
 def promote_first_row_as_header_if_needed(dataframe: pd.DataFrame) -> pd.DataFrame:
     has_unnamed_headers = any(
         str(column).strip().lower().startswith("unnamed:")
@@ -150,6 +182,7 @@ def consolidate_sheet_from_files(
         try:
             df = pd.read_excel(file_path, sheet_name=sheet_name)
             df = promote_first_row_as_header_if_needed(df)
+            df = assign_link_type_from_column_r(df)
             inferred_circle = infer_circle_from_file_name(file_path.name)
             existing_circle_column = get_column_by_normalized_name(df, "Circle")
             if existing_circle_column is None:
@@ -207,13 +240,23 @@ def consolidate_sheet_from_files(
         ]
         consolidated = pd.concat(standardized, ignore_index=True)
 
-        # Keep source file column at the very beginning in output.
+        # Keep source file column at the very beginning in output, then Circle,
+        # and place Link Type immediately after Cluster ID for row-wise readability.
         source_column = "source_file_name"
         circle_column = "Circle"
-        ordered_columns = [source_column, circle_column] + [
-            column for column in consolidated.columns if column != source_column
-            and column != circle_column
+        link_type_column = LINK_TYPE_OUTPUT_COLUMN
+        cluster_id_column = get_column_by_normalized_name(consolidated, "Cluster ID")
+        remaining_columns = [
+            column
+            for column in consolidated.columns
+            if column not in (source_column, circle_column, link_type_column)
         ]
+        if cluster_id_column is not None and cluster_id_column in remaining_columns:
+            insert_at = remaining_columns.index(cluster_id_column) + 1
+            remaining_columns.insert(insert_at, link_type_column)
+        else:
+            remaining_columns.append(link_type_column)
+        ordered_columns = [source_column, circle_column] + remaining_columns
         consolidated = consolidated[ordered_columns]
         return consolidated, report_df
 
